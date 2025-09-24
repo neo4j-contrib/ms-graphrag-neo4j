@@ -434,10 +434,9 @@ class MsGraphRAG:
             result = session.run(Query(text=query, timeout=self.timeout), params)
             return [r.data() for r in result]
 
-    async def achat(self, messages, model="gpt-4o", temperature=0, config={}):
+    async def achat(self, messages, model="gpt-4o", config={}):
         response = await self._openai_client.chat.completions.create(
             model=model,
-            temperature=temperature,
             messages=messages,
             **config,
         )
