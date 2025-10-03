@@ -125,8 +125,8 @@ CALL apoc.path.subgraphAll(nodes[0], {
 })
 YIELD relationships
 RETURN c.id AS communityId,
-       [n in nodes | {id: n.id, description: n.summary, type: [el in labels(n) WHERE el <> '__Entity__'][0]}] AS nodes,
-       [r in relationships | {start: startNode(r).id, type: type(r), end: endNode(r).id, description: r.summary}] AS rels
+       [n in nodes | {id: n.name, description: n.summary, type: [el in labels(n) WHERE el <> '__Entity__'][0]}] AS nodes,
+       [r in relationships | {start: startNode(r).name, type: type(r), end: endNode(r).name, description: r.summary}] AS rels
 """
 
 import_community_summary = """
