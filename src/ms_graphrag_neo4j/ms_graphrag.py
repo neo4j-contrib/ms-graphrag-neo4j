@@ -3,6 +3,8 @@ from typing import Any, Dict, List, Optional, Type
 from neo4j import Driver
 from openai import AsyncOpenAI
 import asyncio
+import json
+from functools import wraps
 
 
 from tqdm.asyncio import tqdm, tqdm_asyncio
@@ -11,6 +13,38 @@ from tqdm.asyncio import tqdm, tqdm_asyncio
 from ms_graphrag_neo4j.cypher_queries import *
 from ms_graphrag_neo4j.utils import *
 from ms_graphrag_neo4j.prompts import *
+
+
+def async_retry(max_retries=3, delay=1, backoff=2, exceptions=(Exception,)):
+    """
+    Async retry decorator with exponential backoff.
+    
+    Args:
+        max_retries (int): Maximum number of retry attempts
+        delay (float): Initial delay between retries in seconds
+        backoff (float): Multiplier for delay after each retry
+        exceptions (tuple): Tuple of exceptions to catch and retry on
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            _delay = delay
+            last_exception = None
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        await asyncio.sleep(_delay)
+                        _delay *= backoff
+                    else:
+                        raise e
+            
+            raise last_exception
+        return wrapper
+    return decorator
 
 
 class MsGraphRAG:
@@ -26,6 +60,7 @@ class MsGraphRAG:
     - Node and relationship summarization for improved retrieval
     - Community detection and summarization for concept clustering
     - Integration with OpenAI models for generation
+    - Retry logic for LLM calls and JSON parsing operations
 
     The class connects to Neo4j for graph storage and uses OpenAI for content generation
     and extraction, providing a seamless way to build knowledge graphs from text
@@ -70,6 +105,9 @@ class MsGraphRAG:
         database: str = "neo4j",
         max_workers: int = 10,
         create_constraints: bool = True,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        retry_backoff: float = 2.0,
     ) -> None:
         """
         Initialize MsGraphRAG with Neo4j driver and LLM.
@@ -80,6 +118,9 @@ class MsGraphRAG:
             database (str, optional): Neo4j database name. Defaults to "neo4j".
             max_workers (int, optional): Maximum number of concurrent workers. Defaults to 10.
             create_constraints (bool, optional): Whether to create database constraints. Defaults to True.
+            max_retries (int, optional): Maximum number of retries for LLM calls. Defaults to 3.
+            retry_delay (float, optional): Initial delay between retries in seconds. Defaults to 1.0.
+            retry_backoff (float, optional): Backoff multiplier for retry delays. Defaults to 2.0.
         """
         if not os.environ.get("OPENAI_API_KEY"):
             raise ValueError(
@@ -90,6 +131,9 @@ class MsGraphRAG:
         self.model = model
         self.max_workers = max_workers
         self._database = database
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.retry_backoff = retry_backoff
         self._openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
         # Test for APOC
         try:
@@ -129,9 +173,16 @@ class MsGraphRAG:
             - Uses parallel processing with tqdm progress tracking
             - Extracted entities and relationships are stored directly in Neo4j
             - Each text document is processed independently by the LLM
+            - Includes retry logic for LLM calls and JSON parsing
         """
 
-        async def process_text(input_text):
+        @async_retry(
+            max_retries=self.max_retries,
+            delay=self.retry_delay,
+            backoff=self.retry_backoff,
+            exceptions=(Exception,)
+        )
+        async def process_text_with_retry(input_text):
             prompt = GRAPH_EXTRACTION_PROMPT.format(
                 entity_types=allowed_entities,
                 input_text=input_text,
@@ -144,11 +195,16 @@ class MsGraphRAG:
             ]
             # Make the LLM call
             output = await self.achat(messages, model=self.model)
-            # Construct JSON from output
-            return parse_extraction_output(output.content)
+            # Construct JSON from output - this may fail and trigger retry
+            try:
+                return parse_extraction_output(output.content)
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                # Log the error if needed
+                print(f"JSON parsing error for extraction: {e}. Retrying...")
+                raise  # Re-raise to trigger retry
 
         # Create tasks for all input texts
-        tasks = [process_text(text) for text in input_texts]
+        tasks = [process_text_with_retry(text) for text in input_texts]
 
         # Process tasks with tqdm progress bar
         # Use semaphore to limit concurrent tasks if max_workers is specified
@@ -297,6 +353,7 @@ class MsGraphRAG:
             - Generates hierarchical community structures in the graph
             - Uses LLM to create descriptive summaries of each community
             - The community summaries include key entities, relationships, and themes
+            - Includes retry logic for LLM calls and JSON extraction
         """
         # Calculate communities
         self.query(drop_gds_graph_query)
@@ -316,8 +373,14 @@ class MsGraphRAG:
             levels = [community_levels - 1]
         communities = self.query(community_info_query, params={"levels": levels})
 
-        # Define async function for processing a single community
-        async def process_community(community):
+        # Define async function for processing a single community with retry
+        @async_retry(
+            max_retries=self.max_retries,
+            delay=self.retry_delay,
+            backoff=self.retry_backoff,
+            exceptions=(Exception,)
+        )
+        async def process_community_with_retry(community):
             input_text = f"""Entities:
                     {community['nodes']}
 
@@ -331,10 +394,18 @@ class MsGraphRAG:
                 },
             ]
             summary = await self.achat(messages, model=self.model)
-            return {
-                "community": extract_json(summary.content),
-                "communityId": community["communityId"],
-            }
+            
+            # Try to extract JSON - this may fail and trigger retry
+            try:
+                extracted_json = extract_json(summary.content)
+                return {
+                    "community": extracted_json,
+                    "communityId": community["communityId"],
+                }
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                # Log the error if needed
+                print(f"JSON parsing error for community summary: {e}. Retrying...")
+                raise  # Re-raise to trigger retry
 
         # Process all communities concurrently with tqdm progress bar and max_workers limit
         if self.max_workers:
@@ -342,7 +413,7 @@ class MsGraphRAG:
 
             async def process_community_with_semaphore(community):
                 async with semaphore:
-                    return await process_community(community)
+                    return await process_community_with_retry(community)
 
             community_summary = await tqdm_asyncio.gather(
                 *(
@@ -354,7 +425,7 @@ class MsGraphRAG:
             )
         else:
             community_summary = await tqdm_asyncio.gather(
-                *(process_community(community) for community in communities),
+                *(process_community_with_retry(community) for community in communities),
                 desc="Summarizing communities",
                 total=len(communities),
             )
