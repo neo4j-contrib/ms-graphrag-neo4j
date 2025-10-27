@@ -5,6 +5,11 @@ Query-focused summarization (QFS) is a summarization task where the objective is
 
 Learn more about [GraphRAG](https://graphrag.com/).
 
+Related blog posts:
+
+* [Exploring RAG and GraphRAG](https://weaviate.io/blog/graph-rag)
+* [Implementing DRIFT search](https://towardsdatascience.com/implementing-drift-search-with-neo4j-and-llamaindex/)
+
 ## Overview
 
 MsGraphRAG-Neo4j is a Python library that implements Microsoft's GraphRAG methodology with Neo4j as the graph database backend. This library provides a seamless way to:
